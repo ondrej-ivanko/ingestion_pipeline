@@ -27,11 +27,11 @@ flowchart TB
     AF --> AD2
     AF --> AD3
     AF --> AD4
-    K1 --> W1[Sanitize/Validate workers - KEDA scaled 0-100]
+    K1 --> W1[Sanitize/Validate workers - KEDA scaled 0-100 pods/stage]
     W1 --> K2[(Kafka validated)]
-    K2 --> W2[Transform/Classify workers - KEDA scaled 0-100]
+    K2 --> W2[Transform/Classify workers - KEDA scaled 0-100 pods/stage]
     W2 --> K3[(Kafka transformed)]
-    K3 --> W3[Sink workers - KEDA scaled 0-100]
+    K3 --> W3[Sink workers - KEDA scaled 0-100 pods/stage]
     W1 -->|failed after retries| ST[(Kafka stale + PostgreSQL register)]
     W2 -->|failed after retries| ST
     W3 -->|failed after retries| ST
@@ -61,9 +61,9 @@ flowchart TD
     F -->|no mapping or unclassifiable after retries| ST
     F -->|resolved| G[Classify - external_id to internal UUID]
     G -->|dependency resolved| H[Kafka transformed]
-    G -->|product not yet present| STAGE[Stage event - re-resolve when product arrives]
+    G -->|product not yet present| STAGE[Stage event non-blocking time-bounded - re-resolve when product arrives or timeout expires]
     STAGE --> H
-    G -->|product never appears| WARN2[Record warning - write with unresolved reference]
+    G -->|product never appears| WARN2[Record warning - write with unresolved reference after timeout item terminal partition not blocked]
     WARN2 --> H
     H --> I[Sink - batched idempotent write to BigTable and ElasticSearch]
     I -->|sink failure after retries| ST
@@ -120,13 +120,13 @@ All four formats describe the same system. The Mermaid format is the source of t
 - The import continues on a best-effort basis when an item fails validation or transformation. The failing item is quarantined, a warning or error record is issued, and the remaining items continue.
 - Workers are stateless. All durable state resides in PostgreSQL for coordination and in Kafka for the message log, so any worker can be terminated and replaced without data loss.
 - Delivery is at-least-once, and every sink write is idempotent. Sinks use deterministic keys based on the internal UUID and the external identifier, so retried batches converge to the same record instead of creating duplicates.
-- Only one import job runs per customer at a given time. PostgreSQL enforces this with a partial unique index on active jobs per customer, and the dispatcher claims jobs with row locks so that concurrent dispatchers cannot claim the same job.
-- Kafka partitions items by `customer_id`, which provides per-customer first-in-first-out ordering of granular items within a running job. The `external_id` is the identity and deduplication key in the tuple `(source_system, entity_type, external_id)`, and it is not used as the partition key or as the locking key.
-- Job priority is more important than global first-in-first-out order. Periodic jobs are dispatched before one-time jobs, and a periodic job starts within 60 seconds of its scheduled time. If all 100 running slots are occupied, the dispatcher cooperatively pauses the lowest-priority running one-time job at its next batch checkpoint and releases the slot.
+- Only one import job is in RUNNING state per customer at a given time. PostgreSQL enforces this with a partial unique index on active jobs per customer (active = RUNNING + PAUSED; a PAUSED job retains its reservation except during a preemption handoff, where the lock transfers to the preempting periodic job until it finishes), and the dispatcher claims jobs with row locks so that concurrent dispatchers cannot claim the same job.
+- Kafka partitions items by `customer_id`, which provides per-customer first-in-first-out ordering of granular items *within one running job*. The `external_id` is the identity and deduplication key in the tuple `(source_system, entity_type, external_id)`, and it is not used as the partition key or as the locking key. Across jobs of the same customer, FIFO is not guaranteed when preemption occurs: a periodic job may complete before an earlier paused one-time job, and out-of-order completion is resolved by last-write-wins (source timestamp / sequence version).
+- Job priority is more important than global first-in-first-out order. Periodic jobs are dispatched before one-time jobs. A periodic job has a 60-second start SLO (scheduled minute in UTC to worker-ready time, warning at 30 s / critical at 60 s), not an absolute guarantee: if all 100 running *job* slots are occupied by non-pausable periodic jobs, the SLO cannot be met and the deviation is recorded and alerted. "100 slots" means 100 concurrently admitted jobs (dispatcher counter in PostgreSQL); this is distinct from worker pods, which scale to 100 per stage (see below). If a slot is free, the periodic job starts immediately; otherwise the dispatcher cooperatively pauses the lowest-priority running one-time job at its next batch checkpoint and releases the slot. Priority-first ordering has no fairness bound: under continuous periodic load, one-time jobs may be delayed indefinitely, which is a capacity-planning signal.
 - Kafka offsets are committed per batch, after every item in the batch reaches a terminal state. Offsets are never held for the duration of a whole job, because that would block the customer partition behind a single failing item and would violate the best-effort requirement.
 - Large source data is split by the input producer into granular items before publication. Each granular item carries a parent identifier, a chunk index, a chunk count, a byte range, a total size, and a checksum. The sink layer assembles chunks by parent identifier when all chunks are present.
-- Workers scale to zero when idle and scale up to 100 when work arrives. Each worker stage scales independently based on its own Kafka consumer lag. The control plane, the Airflow scheduler, PostgreSQL, and Kafka run with fixed minimal replicas.
-- Airflow manages job lifecycles only. Airflow learns job success from the aggregated outcome counters in PostgreSQL through the Control Plane API. Airflow does not receive per-item results, and the Airflow result backend stores task state only.
+- Worker pods (Sanitize/Validate, Transform/Classify, Sink stages) scale to zero when idle and scale up to 100 pods per stage when work arrives, each stage scaling independently based on its own Kafka consumer lag (up to 300 pods total across the three stages). The control plane, the Airflow scheduler, PostgreSQL, and Kafka run with fixed minimal replicas and do not scale to zero; "scale to zero" means worker stages only. Cold-start time counts toward the 60-second SLO unless a warm pool is configured for the periodic path.
+- Airflow manages job lifecycles only. Airflow learns job success from the aggregated outcome counters in PostgreSQL through the Control Plane API. Airflow does not receive per-item results, and the Airflow result backend stores task state only. Operator semantics: pause stops adapter production, workers finish the current batch then checkpoint (offsets committed, watermark saved), job moves to PAUSED and its slot is released; resume continues from the committed offset/watermark in priority order; cancel stops production, in-flight items finish the current batch to a terminal state (sink or stale), already-written sink data is not rolled back (no compensation), and the job moves to CANCELLED with an outcome record noting partial results.
 - Secrets are injected at pod start by the Infisical Kubernetes operator. Only secret references are stored in PostgreSQL and Kafka, and secret values never appear in messages, logs, traces, or database fields.
 - Mapping definitions are versioned, stored in source control, loaded into PostgreSQL at runtime, and pinned per job. Updating a mapping and replaying stale items is the primary remediation path.
 
@@ -159,12 +159,12 @@ The system exposes metrics, traces, logs, profiling data, and per-job outcome re
 | Metric | Type | Meaning and use |
 | --- | --- | --- |
 | `pipeline_items_total{stage, status}` | Counter | Counts items per stage and outcome. This is the primary throughput and quality signal. |
-| `items_per_second` | Gauge over a rolling window | Measures end-to-end throughput in granular items per second. This is the acceptance metric for the 10,000 items per second target. |
+| `items_per_second` | Gauge over a rolling window | Measures end-to-end throughput in granular items per second (items committed to both sinks, rolling 1-minute window). This is the acceptance target for 10,000 items per second with 100 worker pods per stage (100 items/s/pod/stage); it is a load-test target, not a guarantee until the soak gate passes. |
 | `job_duration_seconds{customer_id, source_system}` | Histogram | Measures job duration and identifies slow customers or sources. |
 | `job_outcome_total{status}` | Counter | Counts jobs by terminal state. |
 | `job_items_total{job_id, outcome}` | Counter | Records received, validated, transformed, written per sink, warnings, and stale items per job. This is the evaluable result of a run. |
 | `consumer_lag{topic, partition}` | Gauge | Measures unconsumed messages per partition. Growing lag is the primary capacity alert. |
-| `queue_depth{job_status}` | Gauge | Measures queued, running, and paused jobs. This verifies the 100-job limit and the FIFO queue. |
+| `queue_depth{job_status}` | Gauge | Measures queued, running, and paused jobs. This verifies the 100-job admission limit and the priority-ordered queue (Section 2.1, not global FIFO). |
 | `schedule_deviation_seconds` | Gauge and histogram | Measures the deviation between scheduled and actual job start. A warning alert fires at 30 seconds and a critical alert fires at 60 seconds. |
 | `preemptions_total` | Counter | Counts periodic jobs that paused a one-time job to meet the deadline. This is the capacity-planning signal. |
 | `dlq_total{stage, reason_code}` | Counter | Counts items moved to the stale store per stage and reason. A spike indicates a data-quality or mapping problem. |
@@ -172,7 +172,7 @@ The system exposes metrics, traces, logs, profiling data, and per-job outcome re
 | `retries_total{stage}` | Counter | Measures retry pressure per stage. A rising trend indicates an unstable sink or source. |
 | `sink_write_latency_seconds{sink}` | Histogram, p50/p95/p99 | Measures BigTable and ElasticSearch write latency. |
 | `sink_errors_total{sink}` | Counter | Counts sink write failures per sink. |
-| `worker_replicas{stage}` | Gauge | Measures the replica count per worker stage. This verifies scale-to-zero and the 100-worker ceiling. |
+| `worker_replicas{stage}` | Gauge | Measures the replica count per worker stage. This verifies scale-to-zero (worker stages only) and the 100-pods-per-stage ceiling. |
 | `worker_utilization{stage}` | Gauge | Measures utilisation during active periods. |
 | `mapping_lookup_latency_seconds` | Histogram | Measures mapping registry lookup latency in the Transform stage. |
 | `transform_failures_total{reason_code}` | Counter | Counts transformation failures per reason. |
@@ -207,5 +207,5 @@ The system exposes metrics, traces, logs, profiling data, and per-job outcome re
 - The system raises an alert when consumer lag grows monotonically.
 - The system raises a warning alert at 30 seconds of schedule deviation and a critical alert above 60 seconds.
 - The system raises an alert when the stale rate or the warning rate exceeds its configured threshold.
-- The system raises an alert when worker replicas reach 100 while consumer lag remains.
+- The system raises an alert when a worker stage reaches 100 pods while consumer lag remains.
 - The system raises an alert when a sink error budget is exhausted.
